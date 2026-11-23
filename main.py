@@ -93,13 +93,11 @@ HIGH_PRIORITY_LINK = re.compile(r"(company|about|overview|profile|law|tokushoho|
 MID_PRIORITY_LINK = re.compile(r"(shop|store|salon|clinic|access|contact|店舗|医院|サロン|アクセス|お問い合わせ)", re.IGNORECASE)
 
 def resolve_available_gemini_models() -> list[str]:
-    """APIキーで実際にgenerateContentが利用可能なFlash系モデルを自動取得して優先順位付け"""
     preferred_order = [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3.1-flash",
         "gemini-3.0-flash",
         "gemini-3-flash-preview",
-        "gemini-2.0-flash",
         "gemini-flash-latest"
     ]
     available = []
@@ -115,9 +113,9 @@ def resolve_available_gemini_models() -> list[str]:
 
     ordered = [p for p in preferred_order if p in available]
     for a in available:
-        if a not in ordered:
+        if a not in ordered and not a.startswith("gemini-2."):
             ordered.append(a)
-    return ordered if ordered else ["gemini-2.5-flash-lite", "gemini-2.0-flash"]
+    return ordered if ordered else ["gemini-3.1-flash-lite"]
 
 def normalize_domain(domain: str) -> str:
     d = domain.strip().lower()
