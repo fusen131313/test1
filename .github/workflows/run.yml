@@ -1,0 +1,33 @@
+name: Auto Fetch New HP Leads (4 Parallel CT Logs)
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  fetch-ct-logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        operator: [google, cloudflare, sectigo, letsencrypt]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp aiodns beautifulsoup4 cryptography pydantic google-genai
+
+      - name: Run crawler for ${{ matrix.operator }}
+        env:
+          GAS_WEBAPP_URL: ${{ secrets.GAS_WEBAPP_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python main.py ${{ matrix.operator }}
