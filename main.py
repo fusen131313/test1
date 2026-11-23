@@ -92,6 +92,33 @@ FALLBACK_LOGS = {
 HIGH_PRIORITY_LINK = re.compile(r"(company|about|overview|profile|law|tokushoho|会社概要|企業情報|法人概要|特定商取引)", re.IGNORECASE)
 MID_PRIORITY_LINK = re.compile(r"(shop|store|salon|clinic|access|contact|店舗|医院|サロン|アクセス|お問い合わせ)", re.IGNORECASE)
 
+def resolve_available_gemini_models() -> list[str]:
+    """APIキーで実際にgenerateContentが利用可能なFlash系モデルを自動取得して優先順位付け"""
+    preferred_order = [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.0-flash",
+        "gemini-3-flash-preview",
+        "gemini-2.0-flash",
+        "gemini-flash-latest"
+    ]
+    available = []
+    try:
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").replace("models/", "")
+            methods = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None) or []
+            if "flash" in name.lower() and (not methods or "generateContent" in methods):
+                if "embedding" not in name.lower() and "image" not in name.lower() and "audio" not in name.lower():
+                    available.append(name)
+    except Exception as e:
+        print(f"[{TARGET_OPERATOR}] モデル一覧取得スキップ: {e}")
+
+    ordered = [p for p in preferred_order if p in available]
+    for a in available:
+        if a not in ordered:
+            ordered.append(a)
+    return ordered if ordered else ["gemini-2.5-flash-lite", "gemini-2.0-flash"]
+
 def normalize_domain(domain: str) -> str:
     d = domain.strip().lower()
     d = re.sub(r"^https?://", "", d).split("/")[0].split(":")[0]
@@ -397,7 +424,7 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
 
     return combined_text[:5200]
 
-async def analyze_batch_with_gemini(site_items: list[dict], today_str: str) -> list[dict]:
+async def analyze_batch_with_gemini(site_items: list[dict], today_str: str, candidate_models: list[str]) -> list[dict]:
     sites_block = ""
     for idx, item in enumerate(site_items):
         sites_block += f"\n--- サイトID: {idx} | ドメイン: {item['domain']} ---\n{item['text']}\n"
@@ -418,9 +445,9 @@ async def analyze_batch_with_gemini(site_items: list[dict], today_str: str) -> l
 【分析対象サイト一覧】
 {sites_block}
 """
-    candidate_models = ["gemini-3.0-flash", "gemini-3-flash-preview"]
-    for attempt in range(4):
-        model_name = candidate_models[0] if attempt < 2 else candidate_models[1]
+    model_idx = 0
+    for attempt in range(5):
+        model_name = candidate_models[min(model_idx, len(candidate_models) - 1)]
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
@@ -434,8 +461,13 @@ async def analyze_batch_with_gemini(site_items: list[dict], today_str: str) -> l
             res_json = json.loads(response.text)
             return res_json if isinstance(res_json, list) else []
         except Exception as e:
-            wait_sec = 5 if "404" in str(e) else 15 * (attempt + 1)
-            print(f"[{TARGET_OPERATOR}] Gemini APIリトライ ({attempt + 1}/4, model={model_name}, {wait_sec}s): {e}")
+            err_str = str(e)
+            if "404" in err_str:
+                model_idx += 1
+                wait_sec = 2
+            else:
+                wait_sec = 15 * (attempt + 1)
+            print(f"[{TARGET_OPERATOR}] Gemini APIリトライ ({attempt + 1}/5, model={model_name}, {wait_sec}s): {e}")
             await asyncio.sleep(wait_sec)
     return []
 
@@ -443,6 +475,9 @@ async def main():
     offset = OPERATOR_START_OFFSET.get(TARGET_OPERATOR, 0)
     if offset > 0:
         await asyncio.sleep(offset)
+
+    candidate_models = resolve_available_gemini_models()
+    print(f"[{TARGET_OPERATOR}] 利用可能Geminiモデル候補: {candidate_models[:3]}")
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     cert_cutoff_dt = now_utc - datetime.timedelta(days=90)
@@ -535,7 +570,7 @@ async def main():
         new_rows = []
         for i in range(0, len(valid_sites), 10):
             batch = valid_sites[i:i + 10]
-            ai_results = await analyze_batch_with_gemini(batch, today_jst)
+            ai_results = await analyze_batch_with_gemini(batch, today_jst, candidate_models)
             res_map = {r.get("id"): r for r in ai_results if isinstance(r, dict)}
 
             for idx, item in enumerate(batch):
