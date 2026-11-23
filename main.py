@@ -245,6 +245,7 @@ async def fetch_ct_log_dynamic(session: aiohttp.ClientSession, log_key: str, bas
 async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str, str], list[str]]:
     loop = asyncio.get_running_loop()
     resolver = aiodns.DNSResolver(nameservers=["8.8.8.8", "1.1.1.1"], timeout=2.0, loop=loop)
+    dns_fn = getattr(resolver, "query_dns", resolver.query)
     sem = asyncio.Semaphore(DNS_CONCURRENCY)
     ip_map = {}
     unresolved_jp_candidates = []
@@ -253,10 +254,13 @@ async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str
         async with sem:
             for host in (domain, f"www.{domain}"):
                 try:
-                    res = await resolver.query(host, "A")
-                    if res and getattr(res[0], "host", None):
-                        ip_map[domain] = res[0].host
-                        return
+                    res = await dns_fn(host, "A")
+                    if res:
+                        first = res[0]
+                        ip = getattr(first, "host", None) or getattr(getattr(first, "data", None), "host", None)
+                        if ip:
+                            ip_map[domain] = ip
+                            return
                 except Exception:
                     pass
                 try:
@@ -273,8 +277,12 @@ async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str
                 unresolved_jp_candidates.append(domain)
             else:
                 try:
-                    ns_res = await resolver.query(domain, "NS")
-                    if any(JP_NS_PATTERN.search(ns.host) for ns in ns_res):
+                    ns_res = await dns_fn(domain, "NS")
+                    ns_hosts = [
+                        getattr(n, "host", "") or getattr(getattr(n, "data", None), "host", "")
+                        for n in (ns_res or [])
+                    ]
+                    if any(JP_NS_PATTERN.search(h) for h in ns_hosts if h):
                         unresolved_jp_candidates.append(domain)
                 except Exception:
                     pass
@@ -410,11 +418,13 @@ async def analyze_batch_with_gemini(site_items: list[dict], today_str: str) -> l
 【分析対象サイト一覧】
 {sites_block}
 """
+    candidate_models = ["gemini-3.0-flash", "gemini-3-flash-preview"]
     for attempt in range(4):
+        model_name = candidate_models[0] if attempt < 2 else candidate_models[1]
         try:
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-2.5-flash",
+                model=model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -424,8 +434,8 @@ async def analyze_batch_with_gemini(site_items: list[dict], today_str: str) -> l
             res_json = json.loads(response.text)
             return res_json if isinstance(res_json, list) else []
         except Exception as e:
-            wait_sec = 15 * (attempt + 1)
-            print(f"[{TARGET_OPERATOR}] Gemini APIリトライ待機 ({attempt + 1}/4, {wait_sec}s): {e}")
+            wait_sec = 5 if "404" in str(e) else 15 * (attempt + 1)
+            print(f"[{TARGET_OPERATOR}] Gemini APIリトライ ({attempt + 1}/4, model={model_name}, {wait_sec}s): {e}")
             await asyncio.sleep(wait_sec)
     return []
 
