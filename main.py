@@ -25,22 +25,33 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 
 class SiteAnalysisResult(BaseModel):
     id: int
-    is_target: bool
+    is_japan_business: bool
     is_newly_launched: bool
     company_name: str
     prefecture: str
     address: str
     phone: str
 
-MAX_TOTAL_ENTRIES_PER_JOB = 120000
-INITIAL_LOOKBACK_ENTRIES = 50000
-DNS_CONCURRENCY = 40
+MAX_TOTAL_ENTRIES_PER_JOB = 200000
+MIN_ENTRIES_PER_LOG = 25000
+INITIAL_LOOKBACK_ENTRIES = 60000
+DNS_CONCURRENCY = 50
 
 OPERATOR_START_OFFSET = {
     "google": 0,
     "cloudflare": 3,
     "sectigo": 6,
     "letsencrypt": 9
+}
+
+VALID_JP_PREFECTURES = {
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+    "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+    "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+    "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"
 }
 
 EXCLUDED_TLDS = {
@@ -357,7 +368,8 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
 
     html_tag = soup.find("html")
     if html_tag and html_tag.get("lang"):
-        if not html_tag["lang"].lower().startswith("ja"):
+        lang_val = html_tag["lang"].strip().lower()
+        if lang_val and not lang_val.startswith("ja"):
             return ""
 
     tel_numbers = set()
@@ -403,7 +415,8 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
         return f"{full_str[:2000]} ... {full_str[-1200:]}"
 
     top_text = extract_head_and_footer(soup)
-    if len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF]", top_text)) < 50:
+    kana_count = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF]", top_text))
+    if kana_count < 80:
         return ""
 
     combined_text = f"【トップページ】\n{top_text}"
@@ -431,14 +444,18 @@ async def analyze_batch_with_gemini(site_items: list[dict], today_str: str, cand
 あなたは日本のWebサイト調査アナリストです。本日は {today_str} です。
 以下の複数サイト（サイトID: 0〜{len(site_items)-1}）をそれぞれ分析し、指定のJSON配列スキーマで回答してください。
 
-【判定・抽出基準】
+【厳守ルール（海外サイト完全除外）】
+- 日本国内に事業所・店舗・拠点を持つ日本の法人・店舗・個人事業主の公式Webサイトのみを抽出対象とします。
+- イタリア・アメリカ・中国など日本国外の企業・店舗（海外住所・海外電話番号・日本語以外のメインサイト）は、たとえ事業サイトであっても必ず `is_japan_business: false` にしてください。
+
+【各フィールドの判定・抽出基準】
 - id: 入力のサイトID
-- is_target: 中小企業・店舗・クリニック・士業・個人事業主などの事業用公式Webサイトなら true。個人ブログ・アフィリエイト・ポータル・上場大企業・官公庁・ECモール内ページは false。
-- is_newly_launched: 本日（{today_str}）から遡って「直近3か月以内」に新規公開または全面リニューアルされたHPと推測される場合のみ true。コピーライトが複数年表記（例: 2018-2026）や過去の年号のみ、または数年前のニュース記事がある既存サイトは false。
-- company_name: 会社名・屋号・店舗名・医院名（不明なら ""）
-- prefecture: 都道府県名（例: "東京都"。住所や市外局番から補完可。不明なら ""）
-- address: 都道府県以降の住所（不明なら ""）
-- phone: 代表・問い合わせ電話番号（ハイフンあり統一、FAX除外、検出telリンクも参考に抽出、不明なら ""）
+- is_japan_business: 「日本国内拠点の事業用公式Webサイト（中小企業・店舗・クリニック・士業・個人事業主など）」なら true。海外企業・個人ブログ・アフィリエイト・ポータル・上場大企業・官公庁・ECモール内ページは false。
+- is_newly_launched: 本日（{today_str}）から遡って「直近3か月以内」に新規公開または全面リニューアルされたHPと推測される場合 true。明らかに過去の年号表記（例: 2018-2026 や 2023年以前のみのコピーライト、2024年以前の古いお知らせ・施工実績・ブログ記事など）がある既存サイトは false。年号記載がないシンプルな立ち上げ直後のサイトは true 寄りで判定可。
+- company_name: 日本の会社名・屋号・店舗名・医院名（不明なら ""）
+- prefecture: 日本の47都道府県名のいずれか（例: "東京都", "大阪府"。住所や市外局番から補完可。日本国外や不明なら ""）
+- address: 都道府県以降の日本の住所（不明なら ""）
+- phone: 日本の代表・問い合わせ電話番号（0から始まるハイフンあり形式、FAX除外、海外番号は除外、不明なら ""）
 
 【分析対象サイト一覧】
 {sites_block}
@@ -512,7 +529,7 @@ async def main():
             return
 
         active_logs = await resolve_all_active_ct_logs(session, TARGET_OPERATOR)
-        per_log_budget = max(5000, MAX_TOTAL_ENTRIES_PER_JOB // max(1, len(active_logs)))
+        per_log_budget = max(MIN_ENTRIES_PER_LOG, MAX_TOTAL_ENTRIES_PER_JOB // max(1, len(active_logs)))
 
         candidate_domains = set()
         if TARGET_OPERATOR == "google":
@@ -553,7 +570,7 @@ async def main():
 
         print(f"[{TARGET_OPERATOR}] 実績IP一致: {len(matched_targets)} 件 / 新規保留追加: {len(new_pending)} 件")
 
-        html_sem = asyncio.Semaphore(15)
+        html_sem = asyncio.Semaphore(20)
         valid_sites = []
 
         async def gather_site(target: dict):
@@ -575,25 +592,36 @@ async def main():
                 ai_res = res_map.get(idx)
                 if not ai_res:
                     continue
-                if ai_res.get("is_target") is True and ai_res.get("is_newly_launched") is True:
-                    new_rows.append([
-                        item["domain"],
-                        f"{item['ip']} ({item['label']})",
-                        today_jst,
-                        ai_res.get("company_name", ""),
-                        ai_res.get("prefecture", ""),
-                        ai_res.get("address", ""),
-                        ai_res.get("phone", ""),
-                        False,
-                        False
-                    ])
+                if ai_res.get("is_japan_business") is not True or ai_res.get("is_newly_launched") is not True:
+                    continue
+
+                pref = str(ai_res.get("prefecture", "")).strip()
+                phone = str(ai_res.get("phone", "")).strip()
+
+                # 海外データ混入のプログラム側最終ブロック
+                if pref and pref not in VALID_JP_PREFECTURES:
+                    continue
+                if phone.startswith("+") and not phone.startswith("+81"):
+                    continue
+
+                new_rows.append([
+                    item["domain"],
+                    f"{item['ip']} ({item['label']})",
+                    today_jst,
+                    ai_res.get("company_name", ""),
+                    pref,
+                    ai_res.get("address", ""),
+                    phone,
+                    False,
+                    False
+                ])
 
             if i + 10 < len(valid_sites):
-                await asyncio.sleep(5.0)
+                await asyncio.sleep(3.0)
 
         payload = {
             "log_updates": log_updates,
-            "add_pending": new_pending[:300],
+            "add_pending": new_pending[:500],
             "remove_pending": resolved_pending,
             "rows": new_rows
         }
