@@ -36,6 +36,7 @@ MAX_TOTAL_ENTRIES_PER_JOB = 200000
 MIN_ENTRIES_PER_LOG = 25000
 INITIAL_LOOKBACK_ENTRIES = 60000
 DNS_CONCURRENCY = 50
+MAX_UNMATCHED_JP_SAMPLE_PER_JOB = 100
 
 OPERATOR_START_OFFSET = {
     "google": 0,
@@ -100,8 +101,9 @@ FALLBACK_LOGS = {
     ]
 }
 
-HIGH_PRIORITY_LINK = re.compile(r"(company|about|overview|profile|law|tokushoho|会社概要|企業情報|法人概要|特定商取引)", re.IGNORECASE)
-MID_PRIORITY_LINK = re.compile(r"(shop|store|salon|clinic|access|contact|店舗|医院|サロン|アクセス|お問い合わせ)", re.IGNORECASE)
+HIGH_PRIORITY_LINK = re.compile(r"(company|about|overview|profile|law|tokushoho|contact|inquiry|corporate|gaiyou|会社概要|企業情報|法人概要|特定商取引|お問い合わせ)", re.IGNORECASE)
+MID_PRIORITY_LINK = re.compile(r"(shop|store|salon|clinic|access|office|店舗|医院|サロン|アクセス|事務所)", re.IGNORECASE)
+JP_PHONE_REGEX = re.compile(r"(?:0\d{1,4}[\-\s]?\d{1,4}[\-\s]?\d{3,4}|0120[\-\s]?\d{3}[\-\s]?\d{3}|0800[\-\s]?\d{3}[\-\s]?\d{4})")
 
 def resolve_available_gemini_models() -> list[str]:
     preferred_order = [
@@ -160,6 +162,14 @@ def is_valid_business_domain(domain: str) -> bool:
 def get_ip_prefix(ip: str) -> str:
     parts = ip.strip().split(".")
     return f"{parts[0]}.{parts[1]}.{parts[2]}" if len(parts) == 4 else ""
+
+def is_valid_jp_phone(phone_str: str) -> bool:
+    if not phone_str:
+        return False
+    cleaned = re.sub(r"[^0-9]", "", phone_str)
+    if cleaned.startswith("81") and len(cleaned) >= 11:
+        cleaned = "0" + cleaned[2:]
+    return cleaned.startswith("0") and len(cleaned) in (10, 11)
 
 async def resolve_all_active_ct_logs(session: aiohttp.ClientSession, operator_key: str) -> list[tuple[str, str]]:
     found_logs = []
@@ -278,16 +288,18 @@ async def fetch_ct_log_dynamic(session: aiohttp.ClientSession, log_key: str, bas
 
     return current_idx, extracted
 
-async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str, str], list[str]]:
+async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str, str], list[str], set[str]]:
     loop = asyncio.get_running_loop()
     resolver = aiodns.DNSResolver(nameservers=["8.8.8.8", "1.1.1.1"], timeout=2.0, loop=loop)
     dns_fn = getattr(resolver, "query_dns", resolver.query)
     sem = asyncio.Semaphore(DNS_CONCURRENCY)
     ip_map = {}
     unresolved_jp_candidates = []
+    jp_ns_domains = set()
 
     async def lookup(domain: str):
         async with sem:
+            resolved = False
             for host in (domain, f"www.{domain}"):
                 try:
                     res = await dns_fn(host, "A")
@@ -296,7 +308,8 @@ async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str
                         ip = getattr(first, "host", None) or getattr(getattr(first, "data", None), "host", None)
                         if ip:
                             ip_map[domain] = ip
-                            return
+                            resolved = True
+                            break
                 except Exception:
                     pass
                 try:
@@ -305,12 +318,15 @@ async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str
                     )
                     if infos:
                         ip_map[domain] = infos[0][4][0]
-                        return
+                        resolved = True
+                        break
                 except Exception:
                     pass
 
             if domain.endswith(".jp"):
-                unresolved_jp_candidates.append(domain)
+                jp_ns_domains.add(domain)
+                if not resolved:
+                    unresolved_jp_candidates.append(domain)
             else:
                 try:
                     ns_res = await dns_fn(domain, "NS")
@@ -319,12 +335,35 @@ async def resolve_domains_with_retry_queue(domains: list[str]) -> tuple[dict[str
                         for n in (ns_res or [])
                     ]
                     if any(JP_NS_PATTERN.search(h) for h in ns_hosts if h):
-                        unresolved_jp_candidates.append(domain)
+                        jp_ns_domains.add(domain)
+                        if not resolved:
+                            unresolved_jp_candidates.append(domain)
                 except Exception:
                     pass
 
     await asyncio.gather(*(lookup(d) for d in domains))
-    return ip_map, unresolved_jp_candidates
+    return ip_map, unresolved_jp_candidates, jp_ns_domains
+
+def extract_tel_candidates(soup: BeautifulSoup, plain_text: str) -> set[str]:
+    tels = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.lower().startswith("tel:"):
+            raw_tel = re.sub(r"^\+81\-?", "0", href[4:].strip())
+            num = re.sub(r"[^0-9\-]", "", raw_tel)
+            if is_valid_jp_phone(num):
+                tels.add(num)
+    for img in soup.find_all("img", alt=True):
+        alt_txt = img["alt"].strip()
+        for m in JP_PHONE_REGEX.findall(alt_txt):
+            norm = re.sub(r"\s+", "-", m.strip())
+            if is_valid_jp_phone(norm):
+                tels.add(norm)
+    for m in JP_PHONE_REGEX.findall(plain_text):
+        norm = re.sub(r"\s+", "-", m.strip())
+        if is_valid_jp_phone(norm):
+            tels.add(norm)
+    return tels
 
 async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> str:
     headers = {
@@ -372,15 +411,6 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
         if lang_val and not lang_val.startswith("ja"):
             return ""
 
-    tel_numbers = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.lower().startswith("tel:"):
-            raw_tel = re.sub(r"^\+81\-?", "0", href[4:].strip())
-            num = re.sub(r"[^0-9\-]", "", raw_tel)
-            if len(num) >= 9:
-                tel_numbers.add(num)
-
     final_netloc = urlparse(final_url).netloc
     high_links = []
     mid_links = []
@@ -404,7 +434,7 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
             seen_urls.add(full_sub)
             mid_links.append(full_sub)
 
-    prioritized_sub_urls = (high_links + mid_links)[:2]
+    prioritized_sub_urls = (high_links + mid_links)[:3]
 
     def extract_head_and_footer(s_obj: BeautifulSoup) -> str:
         for tag in s_obj(["script", "style", "noscript", "svg"]):
@@ -414,14 +444,13 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
             return full_str
         return f"{full_str[:2000]} ... {full_str[-1200:]}"
 
+    tel_numbers = extract_tel_candidates(soup, soup.get_text(" ", strip=True))
     top_text = extract_head_and_footer(soup)
     kana_count = len(re.findall(r"[\u3040-\u309F\u30A0-\u30FF]", top_text))
-    if kana_count < 80:
+    if kana_count < 60:
         return ""
 
     combined_text = f"【トップページ】\n{top_text}"
-    if tel_numbers:
-        combined_text += f"\n【検出telリンク】: {', '.join(tel_numbers)}"
 
     for sub_url in prioritized_sub_urls:
         try:
@@ -429,11 +458,34 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
                 if sub_resp.status == 200:
                     sub_bytes = await sub_resp.read()
                     sub_soup = BeautifulSoup(sub_bytes, "html.parser")
-                    combined_text += f"\n【下層】\n{extract_head_and_footer(sub_soup)[:2000]}"
+                    tel_numbers.update(extract_tel_candidates(sub_soup, sub_soup.get_text(" ", strip=True)))
+                    combined_text += f"\n【下層】\n{extract_head_and_footer(sub_soup)[:1800]}"
         except Exception:
             pass
 
-    return combined_text[:5200]
+    if not tel_numbers:
+        base_root = f"{urlparse(final_url).scheme}://{final_netloc}"
+        for fallback_path in ("/company", "/about", "/contact", "/law", "/corporate", "/company/", "/contact/"):
+            cand_url = f"{base_root}{fallback_path}"
+            if cand_url in seen_urls:
+                continue
+            seen_urls.add(cand_url)
+            try:
+                async with session.get(cand_url, headers=headers, timeout=6, ssl=False) as fb_resp:
+                    if fb_resp.status == 200:
+                        fb_bytes = await fb_resp.read()
+                        fb_soup = BeautifulSoup(fb_bytes, "html.parser")
+                        found = extract_tel_candidates(fb_soup, fb_soup.get_text(" ", strip=True))
+                        if found:
+                            tel_numbers.update(found)
+                            combined_text += f"\n【追加探索】\n{extract_head_and_footer(fb_soup)[:1200]}"
+                            break
+            except Exception:
+                pass
+
+    if tel_numbers:
+        combined_text += f"\n【検出電話番号候補】: {', '.join(sorted(tel_numbers))}"
+    return combined_text[:5600]
 
 async def analyze_batch_with_gemini(site_items: list[dict], today_str: str, candidate_models: list[str]) -> list[dict]:
     sites_block = ""
@@ -444,18 +496,18 @@ async def analyze_batch_with_gemini(site_items: list[dict], today_str: str, cand
 あなたは日本のWebサイト調査アナリストです。本日は {today_str} です。
 以下の複数サイト（サイトID: 0〜{len(site_items)-1}）をそれぞれ分析し、指定のJSON配列スキーマで回答してください。
 
-【厳守ルール（海外サイト完全除外）】
-- 日本国内に事業所・店舗・拠点を持つ日本の法人・店舗・個人事業主の公式Webサイトのみを抽出対象とします。
-- イタリア・アメリカ・中国など日本国外の企業・店舗（海外住所・海外電話番号・日本語以外のメインサイト）は、たとえ事業サイトであっても必ず `is_japan_business: false` にしてください。
+【重要方針：取りこぼし防止・目視確認優先】
+- 抽出漏れを防ぐため、「迷うサイト」「判断材料が少ないサイト」は落とさず `true` にして通過させてください。
+- 明確な除外対象（海外サイト・個人ブログ・ポータル・大企業・官公庁・数年前の古い記事が大量にある既存サイト）だけを `false` にしてください。
 
 【各フィールドの判定・抽出基準】
 - id: 入力のサイトID
-- is_japan_business: 「日本国内拠点の事業用公式Webサイト（中小企業・店舗・クリニック・士業・個人事業主など）」なら true。海外企業・個人ブログ・アフィリエイト・ポータル・上場大企業・官公庁・ECモール内ページは false。
-- is_newly_launched: 本日（{today_str}）から遡って「直近3か月以内」に新規公開または全面リニューアルされたHPと推測される場合 true。明らかに過去の年号表記（例: 2018-2026 や 2023年以前のみのコピーライト、2024年以前の古いお知らせ・施工実績・ブログ記事など）がある既存サイトは false。年号記載がないシンプルな立ち上げ直後のサイトは true 寄りで判定可。
+- is_japan_business: 日本国内に拠点がある事業用公式Webサイト（中小企業・店舗・クリニック・士業・個人事業主など）なら true。日本国外の海外企業・個人ブログ・アフィリエイト・ポータル・上場大企業・官公庁・ECモール内ページは false。
+- is_newly_launched: 「明らかな既存サイト」でなければ **原則 true** にすること。ブログやお知らせ機能がない新規サイト、年号記載がないサイト、判断に迷うサイトはすべて true にする。**2024年以前の過去のブログ記事・ニュース・施工実績の日付が明確に掲載されている場合のみ false** とする。
 - company_name: 日本の会社名・屋号・店舗名・医院名（不明なら ""）
-- prefecture: 日本の47都道府県名のいずれか（例: "東京都", "大阪府"。住所や市外局番から補完可。日本国外や不明なら ""）
+- prefecture: 日本の47都道府県名のいずれか（例: "東京都", "福岡県"。住所や市外局番から補完可。日本国外や不明なら ""）
 - address: 都道府県以降の日本の住所（不明なら ""）
-- phone: 日本の代表・問い合わせ電話番号（0から始まるハイフンあり形式、FAX除外、海外番号は除外、不明なら ""）
+- phone: 日本の代表・問い合わせ電話番号（0から始まるハイフンあり形式、FAX除外。画像バナー等で本文から読み取れない場合は無理に推測せず "" にする）
 
 【分析対象サイト一覧】
 {sites_block}
@@ -551,11 +603,12 @@ async def main():
         print(f"[{TARGET_OPERATOR}] フィルタ通過・DNS照会対象ドメイン数: {len(candidate_domains)}")
 
         matched_targets = []
+        unmatched_jp_targets = []
         new_pending = []
         resolved_pending = []
 
         if candidate_domains:
-            ip_map, unresolved_jp = await resolve_domains_with_retry_queue(list(candidate_domains))
+            ip_map, unresolved_jp, jp_ns_domains = await resolve_domains_with_retry_queue(list(candidate_domains))
             new_pending = [d for d in unresolved_jp if d not in pending_domains]
             resolved_pending = [d for d in ip_map.keys() if d in pending_domains]
 
@@ -565,11 +618,20 @@ async def main():
                     matched_targets.append({
                         "domain": domain,
                         "ip": resolved_ip,
-                        "label": target_prefix_map[prefix]
+                        "label": target_prefix_map[prefix],
+                        "is_matched_ip": True
+                    })
+                elif domain in jp_ns_domains and len(unmatched_jp_targets) < MAX_UNMATCHED_JP_SAMPLE_PER_JOB:
+                    unmatched_jp_targets.append({
+                        "domain": domain,
+                        "ip": resolved_ip,
+                        "label": "指定外",
+                        "is_matched_ip": False
                     })
 
-        print(f"[{TARGET_OPERATOR}] 実績IP一致: {len(matched_targets)} 件 / 新規保留追加: {len(new_pending)} 件")
+        print(f"[{TARGET_OPERATOR}] 実績IP一致: {len(matched_targets)} 件 / 指定外JP調査対象: {len(unmatched_jp_targets)} 件 / 新規保留: {len(new_pending)} 件")
 
+        all_targets = matched_targets + unmatched_jp_targets
         html_sem = asyncio.Semaphore(20)
         valid_sites = []
 
@@ -579,12 +641,14 @@ async def main():
                 if text:
                     valid_sites.append({**target, "text": text})
 
-        await asyncio.gather(*(gather_site(t) for t in matched_targets))
+        await asyncio.gather(*(gather_site(t) for t in all_targets))
         print(f"[{TARGET_OPERATOR}] 日本語HTML有効サイト数: {len(valid_sites)}")
 
         new_rows = []
-        for i in range(0, len(valid_sites), 10):
-            batch = valid_sites[i:i + 10]
+        unmatched_rows = []
+
+        for i in range(0, len(valid_sites), 5):
+            batch = valid_sites[i:i + 5]
             ai_results = await analyze_batch_with_gemini(batch, today_jst, candidate_models)
             res_map = {r.get("id"): r for r in ai_results if isinstance(r, dict)}
 
@@ -598,13 +662,13 @@ async def main():
                 pref = str(ai_res.get("prefecture", "")).strip()
                 phone = str(ai_res.get("phone", "")).strip()
 
-                # 海外データ混入のプログラム側最終ブロック
+                # 海外データのみ強制除外（電話番号空欄は目視確認用にそのまま出力）
                 if pref and pref not in VALID_JP_PREFECTURES:
                     continue
-                if phone.startswith("+") and not phone.startswith("+81"):
-                    continue
+                if phone and not is_valid_jp_phone(phone):
+                    phone = ""
 
-                new_rows.append([
+                row_data = [
                     item["domain"],
                     f"{item['ip']} ({item['label']})",
                     today_jst,
@@ -614,16 +678,22 @@ async def main():
                     phone,
                     False,
                     False
-                ])
+                ]
 
-            if i + 10 < len(valid_sites):
-                await asyncio.sleep(3.0)
+                if item["is_matched_ip"]:
+                    new_rows.append(row_data)
+                else:
+                    unmatched_rows.append(row_data)
+
+            if i + 5 < len(valid_sites):
+                await asyncio.sleep(2.5)
 
         payload = {
             "log_updates": log_updates,
             "add_pending": new_pending[:500],
             "remove_pending": resolved_pending,
-            "rows": new_rows
+            "rows": new_rows,
+            "unmatched_rows": unmatched_rows
         }
 
         for attempt in range(5):
@@ -631,7 +701,7 @@ async def main():
                 async with session.post(GAS_WEBAPP_URL, json=payload, timeout=30) as post_resp:
                     res_data = await post_resp.json()
                     if res_data.get("status") == "ok":
-                        print(f"[{TARGET_OPERATOR}] GAS送信完了（追加 {res_data.get('added', 0)} 件）")
+                        print(f"[{TARGET_OPERATOR}] GAS送信完了（新着: {res_data.get('added', 0)} 件 / 指定外: {res_data.get('added_unmatched', 0)} 件）")
                         break
                     print(f"[{TARGET_OPERATOR}] GASロック待機リトライ ({attempt + 1}/5): {res_data}")
             except Exception as e:
