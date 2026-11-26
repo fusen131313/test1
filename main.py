@@ -391,16 +391,16 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
     if meta_refresh and meta_refresh.get("content"):
         m = re.search(r"url\s*=\s*['\"]?([^'\">\s]+)", meta_refresh["content"], re.I)
         if m:
-            redirect_target = urljoin(final_url, m.group(1).strip())
-            if redirect_target.startswith("https://"):
-                try:
+            try:
+                redirect_target = urljoin(final_url, m.group(1).strip())
+                if redirect_target.startswith("https://"):
                     async with session.get(redirect_target, headers=headers, timeout=10, allow_redirects=True, ssl=False) as r_resp:
                         if 200 <= r_resp.status < 300 and str(r_resp.url).startswith("https://"):
                             final_url = str(r_resp.url)
                             raw_bytes = await r_resp.read()
                             soup = BeautifulSoup(raw_bytes, "html.parser")
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
     if len(raw_bytes) < 300:
         return ""
@@ -411,7 +411,13 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
         if lang_val and not lang_val.startswith("ja"):
             return ""
 
-    final_netloc = urlparse(final_url).netloc
+    try:
+        parsed_final = urlparse(final_url)
+        final_netloc = parsed_final.netloc
+        final_scheme = parsed_final.scheme
+    except ValueError:
+        return ""
+
     high_links = []
     mid_links = []
     seen_urls = {final_url, final_url.rstrip("/")}
@@ -421,10 +427,15 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
         if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
             continue
         text = a.get_text(strip=True)
-        full_sub = urljoin(final_url, href).split("#")[0]
+        try:
+            full_sub = urljoin(final_url, href).split("#")[0]
+            parsed_sub = urlparse(full_sub)
+        except ValueError:
+            continue
+
         if full_sub in seen_urls or full_sub.rstrip("/") in seen_urls:
             continue
-        if urlparse(full_sub).netloc != final_netloc:
+        if parsed_sub.netloc != final_netloc:
             continue
 
         if HIGH_PRIORITY_LINK.search(href) or HIGH_PRIORITY_LINK.search(text):
@@ -464,7 +475,7 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
             pass
 
     if not tel_numbers:
-        base_root = f"{urlparse(final_url).scheme}://{final_netloc}"
+        base_root = f"{final_scheme}://{final_netloc}"
         for fallback_path in ("/company", "/about", "/contact", "/law", "/corporate", "/company/", "/contact/"):
             cand_url = f"{base_root}{fallback_path}"
             if cand_url in seen_urls:
@@ -637,9 +648,12 @@ async def main():
 
         async def gather_site(target: dict):
             async with html_sem:
-                text = await fetch_site_full_text(session, target["domain"])
-                if text:
-                    valid_sites.append({**target, "text": text})
+                try:
+                    text = await fetch_site_full_text(session, target["domain"])
+                    if text:
+                        valid_sites.append({**target, "text": text})
+                except Exception:
+                    pass
 
         await asyncio.gather(*(gather_site(t) for t in all_targets))
         print(f"[{TARGET_OPERATOR}] 日本語HTML有効サイト数: {len(valid_sites)}")
@@ -662,7 +676,6 @@ async def main():
                 pref = str(ai_res.get("prefecture", "")).strip()
                 phone = str(ai_res.get("phone", "")).strip()
 
-                # 海外データのみ強制除外（電話番号空欄は目視確認用にそのまま出力）
                 if pref and pref not in VALID_JP_PREFECTURES:
                     continue
                 if phone and not is_valid_jp_phone(phone):
