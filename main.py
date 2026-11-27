@@ -31,12 +31,17 @@ class SiteAnalysisResult(BaseModel):
     prefecture: str
     address: str
     phone: str
+    major_industry: str
+    industry_detail: str
+    capital: str
+    employees: str
 
 MAX_TOTAL_ENTRIES_PER_JOB = 200000
 MIN_ENTRIES_PER_LOG = 25000
 INITIAL_LOOKBACK_ENTRIES = 60000
 DNS_CONCURRENCY = 50
 MAX_UNMATCHED_JP_SAMPLE_PER_JOB = 100
+DOMAIN_AGE_LIMIT_DAYS = 183  # 半年（約183日）
 
 OPERATOR_START_OFFSET = {
     "google": 0,
@@ -102,7 +107,7 @@ FALLBACK_LOGS = {
 }
 
 HIGH_PRIORITY_LINK = re.compile(r"(company|about|overview|profile|law|tokushoho|contact|inquiry|corporate|gaiyou|会社概要|企業情報|法人概要|特定商取引|お問い合わせ)", re.IGNORECASE)
-MID_PRIORITY_LINK = re.compile(r"(shop|store|salon|clinic|access|office|店舗|医院|サロン|アクセス|事務所)", re.IGNORECASE)
+MID_PRIORITY_LINK = re.compile(r"(shop|store|salon|clinic|access|office|history|店舗|医院|サロン|アクセス|事務所|沿革)", re.IGNORECASE)
 JP_PHONE_REGEX = re.compile(r"(?:0\d{1,4}[\-\s]?\d{1,4}[\-\s]?\d{3,4}|0120[\-\s]?\d{3}[\-\s]?\d{3}|0800[\-\s]?\d{3}[\-\s]?\d{4})")
 
 def resolve_available_gemini_models() -> list[str]:
@@ -170,6 +175,30 @@ def is_valid_jp_phone(phone_str: str) -> bool:
     if cleaned.startswith("81") and len(cleaned) >= 11:
         cleaned = "0" + cleaned[2:]
     return cleaned.startswith("0") and len(cleaned) in (10, 11)
+
+async def check_domain_rdap_status(session: aiohttp.ClientSession, domain: str, cutoff_dt: datetime.datetime, rdap_sem: asyncio.Semaphore) -> tuple[bool, str]:
+    if domain.endswith(".jp"):
+        return True, "WHOIS作成日: 不明(.jp)"
+    async with rdap_sem:
+        await asyncio.sleep(0.35)  # rdap.orgの10秒10リクエスト制限を回避
+        try:
+            async with session.get(f"https://rdap.org/domain/{domain}", timeout=5, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return True, "WHOIS作成日: 不明"
+                data = await resp.json()
+                for ev in data.get("events", []):
+                    if ev.get("eventAction") == "registration" and ev.get("eventDate"):
+                        reg_str = ev["eventDate"].replace("Z", "+00:00")
+                        reg_dt = datetime.datetime.fromisoformat(reg_str)
+                        if reg_dt.tzinfo is None:
+                            reg_dt = reg_dt.replace(tzinfo=datetime.timezone.utc)
+                        date_only = reg_dt.strftime("%Y-%m-%d")
+                        if reg_dt < cutoff_dt:
+                            return False, f"WHOIS作成日: {date_only} (半年超)"
+                        return True, f"WHOIS作成日: {date_only} (半年以内)"
+        except Exception:
+            pass
+    return True, "WHOIS作成日: 不明"
 
 async def resolve_all_active_ct_logs(session: aiohttp.ClientSession, operator_key: str) -> list[tuple[str, str]]:
     found_logs = []
@@ -365,6 +394,28 @@ def extract_tel_candidates(soup: BeautifulSoup, plain_text: str) -> set[str]:
             tels.add(norm)
     return tels
 
+def collect_priority_links(soup: BeautifulSoup, current_url: str, root_netloc: str, seen_urls: set[str]) -> list[str]:
+    high_links = []
+    mid_links = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            continue
+        text = a.get_text(strip=True)
+        full_sub = urljoin(current_url, href).split("#")[0]
+        if full_sub in seen_urls or full_sub.rstrip("/") in seen_urls:
+            continue
+        if urlparse(full_sub).netloc != root_netloc:
+            continue
+
+        if HIGH_PRIORITY_LINK.search(href) or HIGH_PRIORITY_LINK.search(text):
+            seen_urls.add(full_sub)
+            high_links.append(full_sub)
+        elif MID_PRIORITY_LINK.search(href) or MID_PRIORITY_LINK.search(text):
+            seen_urls.add(full_sub)
+            mid_links.append(full_sub)
+    return high_links + mid_links
+
 async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> str:
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36",
@@ -391,16 +442,16 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
     if meta_refresh and meta_refresh.get("content"):
         m = re.search(r"url\s*=\s*['\"]?([^'\">\s]+)", meta_refresh["content"], re.I)
         if m:
-            try:
-                redirect_target = urljoin(final_url, m.group(1).strip())
-                if redirect_target.startswith("https://"):
+            redirect_target = urljoin(final_url, m.group(1).strip())
+            if redirect_target.startswith("https://"):
+                try:
                     async with session.get(redirect_target, headers=headers, timeout=10, allow_redirects=True, ssl=False) as r_resp:
                         if 200 <= r_resp.status < 300 and str(r_resp.url).startswith("https://"):
                             final_url = str(r_resp.url)
                             raw_bytes = await r_resp.read()
                             soup = BeautifulSoup(raw_bytes, "html.parser")
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
     if len(raw_bytes) < 300:
         return ""
@@ -411,49 +462,19 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
         if lang_val and not lang_val.startswith("ja"):
             return ""
 
-    try:
-        parsed_final = urlparse(final_url)
-        final_netloc = parsed_final.netloc
-        final_scheme = parsed_final.scheme
-    except ValueError:
-        return ""
-
-    high_links = []
-    mid_links = []
+    final_netloc = urlparse(final_url).netloc
     seen_urls = {final_url, final_url.rstrip("/")}
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            continue
-        text = a.get_text(strip=True)
-        try:
-            full_sub = urljoin(final_url, href).split("#")[0]
-            parsed_sub = urlparse(full_sub)
-        except ValueError:
-            continue
-
-        if full_sub in seen_urls or full_sub.rstrip("/") in seen_urls:
-            continue
-        if parsed_sub.netloc != final_netloc:
-            continue
-
-        if HIGH_PRIORITY_LINK.search(href) or HIGH_PRIORITY_LINK.search(text):
-            seen_urls.add(full_sub)
-            high_links.append(full_sub)
-        elif MID_PRIORITY_LINK.search(href) or MID_PRIORITY_LINK.search(text):
-            seen_urls.add(full_sub)
-            mid_links.append(full_sub)
-
-    prioritized_sub_urls = (high_links + mid_links)[:3]
+    # 2階層目リンク収集（最大3件）
+    level2_urls = collect_priority_links(soup, final_url, final_netloc, seen_urls)[:3]
 
     def extract_head_and_footer(s_obj: BeautifulSoup) -> str:
         for tag in s_obj(["script", "style", "noscript", "svg"]):
             tag.decompose()
         full_str = re.sub(r"\s+", " ", s_obj.get_text(separator=" ", strip=True))
-        if len(full_str) <= 3200:
+        if len(full_str) <= 3000:
             return full_str
-        return f"{full_str[:2000]} ... {full_str[-1200:]}"
+        return f"{full_str[:1900]} ... {full_str[-1100:]}"
 
     tel_numbers = extract_tel_candidates(soup, soup.get_text(" ", strip=True))
     top_text = extract_head_and_footer(soup)
@@ -462,20 +483,37 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
         return ""
 
     combined_text = f"【トップページ】\n{top_text}"
+    level3_candidates = []
 
-    for sub_url in prioritized_sub_urls:
+    # 2階層目の取得 ＋ 3階層目リンクの収集
+    for sub_url in level2_urls:
         try:
             async with session.get(sub_url, headers=headers, timeout=8, ssl=False) as sub_resp:
                 if sub_resp.status == 200:
                     sub_bytes = await sub_resp.read()
                     sub_soup = BeautifulSoup(sub_bytes, "html.parser")
                     tel_numbers.update(extract_tel_candidates(sub_soup, sub_soup.get_text(" ", strip=True)))
-                    combined_text += f"\n【下層】\n{extract_head_and_footer(sub_soup)[:1800]}"
+                    level3_candidates.extend(collect_priority_links(sub_soup, sub_url, final_netloc, seen_urls))
+                    combined_text += f"\n【2階層目】\n{extract_head_and_footer(sub_soup)[:1500]}"
         except Exception:
             pass
 
+    # 3階層目の取得（情報が不足している、または3階層目に会社概要等の詳細リンクがある場合のみ最大3件巡回）
+    has_cap_or_emp = ("資本金" in combined_text) or ("従業員" in combined_text)
+    if level3_candidates and (not tel_numbers or not has_cap_or_emp):
+        for l3_url in level3_candidates[:3]:
+            try:
+                async with session.get(l3_url, headers=headers, timeout=7, ssl=False) as l3_resp:
+                    if l3_resp.status == 200:
+                        l3_bytes = await l3_resp.read()
+                        l3_soup = BeautifulSoup(l3_bytes, "html.parser")
+                        tel_numbers.update(extract_tel_candidates(l3_soup, l3_soup.get_text(" ", strip=True)))
+                        combined_text += f"\n【3階層目】\n{extract_head_and_footer(l3_soup)[:1300]}"
+            except Exception:
+                pass
+
     if not tel_numbers:
-        base_root = f"{final_scheme}://{final_netloc}"
+        base_root = f"{urlparse(final_url).scheme}://{final_netloc}"
         for fallback_path in ("/company", "/about", "/contact", "/law", "/corporate", "/company/", "/contact/"):
             cand_url = f"{base_root}{fallback_path}"
             if cand_url in seen_urls:
@@ -489,14 +527,14 @@ async def fetch_site_full_text(session: aiohttp.ClientSession, domain: str) -> s
                         found = extract_tel_candidates(fb_soup, fb_soup.get_text(" ", strip=True))
                         if found:
                             tel_numbers.update(found)
-                            combined_text += f"\n【追加探索】\n{extract_head_and_footer(fb_soup)[:1200]}"
+                            combined_text += f"\n【追加探索】\n{extract_head_and_footer(fb_soup)[:1100]}"
                             break
             except Exception:
                 pass
 
     if tel_numbers:
         combined_text += f"\n【検出電話番号候補】: {', '.join(sorted(tel_numbers))}"
-    return combined_text[:5600]
+    return combined_text[:6800]
 
 async def analyze_batch_with_gemini(site_items: list[dict], today_str: str, candidate_models: list[str]) -> list[dict]:
     sites_block = ""
@@ -514,11 +552,15 @@ async def analyze_batch_with_gemini(site_items: list[dict], today_str: str, cand
 【各フィールドの判定・抽出基準】
 - id: 入力のサイトID
 - is_japan_business: 日本国内に拠点がある事業用公式Webサイト（中小企業・店舗・クリニック・士業・個人事業主など）なら true。日本国外の海外企業・個人ブログ・アフィリエイト・ポータル・上場大企業・官公庁・ECモール内ページは false。
-- is_newly_launched: 「明らかな既存サイト」でなければ **原則 true** にすること。ブログやお知らせ機能がない新規サイト、年号記載がないサイト、判断に迷うサイトはすべて true にする。**2024年以前の過去のブログ記事・ニュース・施工実績の日付が明確に掲載されている場合のみ false** とする。
+- is_newly_launched: 「明らかな既存サイト」でなければ原則 true にすること。ブログやお知らせ機能がない新規サイト、年号記載がないサイト、判断に迷うサイトもすべて true にする。**2024年以前の過去のブログ記事・ニュース・施工実績の日付が明確に掲載されている場合のみ false** とする。
 - company_name: 日本の会社名・屋号・店舗名・医院名（不明なら ""）
 - prefecture: 日本の47都道府県名のいずれか（例: "東京都", "福岡県"。住所や市外局番から補完可。日本国外や不明なら ""）
 - address: 都道府県以降の日本の住所（不明なら ""）
-- phone: 日本の代表・問い合わせ電話番号（0から始まるハイフンあり形式、FAX除外。画像バナー等で本文から読み取れない場合は無理に推測せず "" にする）
+- phone: 日本の代表・問い合わせ電話番号（0から始まるハイフンあり形式、FAX除外。画像バナー等で本文から読み取れない場合は ""）
+- major_industry: 大業種（以下から最も近いものを1つ選択: "建設・不動産", "医療・福祉", "美容・ヘルスケア", "飲食・宿泊", "小売・EC", "IT・Web・通信", "士業・コンサルティング", "製造・メーカー", "教育・スクール", "運輸・物流", "サービス・その他"。不明なら ""）
+- industry_detail: 具体的な業種詳細（例: "内装リフォーム業", "歯科クリニック", "美容室・ヘアサロン", "税理士事務所", "居酒屋・ダイニングバー" など簡潔に記載。不明なら ""）
+- capital: 資本金（会社概要等に記載があれば "1,000万円" のように記載。記載がなければ ""）
+- employees: 従業員数（会社概要等に記載があれば "15名" のように記載。記載がなければ ""）
 
 【分析対象サイト一覧】
 {sites_block}
@@ -559,6 +601,7 @@ async def main():
 
     now_utc = datetime.datetime.now(datetime.timezone.utc)
     cert_cutoff_dt = now_utc - datetime.timedelta(days=90)
+    rdap_cutoff_dt = now_utc - datetime.timedelta(days=DOMAIN_AGE_LIMIT_DAYS)
     today_jst = (now_utc + datetime.timedelta(hours=9)).strftime("%Y-%m-%d")
 
     async with aiohttp.ClientSession() as session:
@@ -644,16 +687,15 @@ async def main():
 
         all_targets = matched_targets + unmatched_jp_targets
         html_sem = asyncio.Semaphore(20)
+        rdap_sem = asyncio.Semaphore(3)
         valid_sites = []
 
+        # ① 先に高速なHTML取得のみ並列実行（RDAP待ちなし）
         async def gather_site(target: dict):
             async with html_sem:
-                try:
-                    text = await fetch_site_full_text(session, target["domain"])
-                    if text:
-                        valid_sites.append({**target, "text": text})
-                except Exception:
-                    pass
+                text = await fetch_site_full_text(session, target["domain"])
+                if text:
+                    valid_sites.append({**target, "text": text})
 
         await asyncio.gather(*(gather_site(t) for t in all_targets))
         print(f"[{TARGET_OPERATOR}] 日本語HTML有効サイト数: {len(valid_sites)}")
@@ -661,6 +703,7 @@ async def main():
         new_rows = []
         unmatched_rows = []
 
+        # ② AI判定を通過した最終候補（数件）だけにRDAP作成日チェックを実施
         for i in range(0, len(valid_sites), 5):
             batch = valid_sites[i:i + 5]
             ai_results = await analyze_batch_with_gemini(batch, today_jst, candidate_models)
@@ -671,6 +714,10 @@ async def main():
                 if not ai_res:
                     continue
                 if ai_res.get("is_japan_business") is not True or ai_res.get("is_newly_launched") is not True:
+                    continue
+
+                is_fresh, _ = await check_domain_rdap_status(session, item["domain"], rdap_cutoff_dt, rdap_sem)
+                if not is_fresh:
                     continue
 
                 pref = str(ai_res.get("prefecture", "")).strip()
@@ -689,6 +736,10 @@ async def main():
                     pref,
                     ai_res.get("address", ""),
                     phone,
+                    ai_res.get("major_industry", ""),
+                    ai_res.get("industry_detail", ""),
+                    ai_res.get("capital", ""),
+                    ai_res.get("employees", ""),
                     False,
                     False
                 ]
